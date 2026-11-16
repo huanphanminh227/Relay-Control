@@ -1,0 +1,217 @@
+#include <Arduino.h>
+
+/**
+ * UTARI - Automated Drop-Weight Impact Testing System
+ * Direct 4-Pin Mapping for ELEGOO 4-Channel Relay (No breadboard splitter needed)
+ */
+
+// ============================================================================
+// 1. RELAY POLARITY CONFIGURATION
+// Set to 'true' for physical ELEGOO 4-Channel Relay (Active-LOW).
+// Set to 'false' for Wokwi Simulator or NPN Transistor Relay (Active-HIGH).
+// ============================================================================
+const bool HOIST_ACTIVE_LOW  = true;  // ELEGOO 4-CH Relay is Active-LOW
+const bool MAGNET_ACTIVE_LOW = false; // Set 'false' for Kit bare relay + PN2222, 'true' for opto module
+
+const int HOIST_ON   = HOIST_ACTIVE_LOW  ? LOW  : HIGH;
+const int HOIST_OFF  = HOIST_ACTIVE_LOW  ? HIGH : LOW;
+const int MAGNET_ON  = MAGNET_ACTIVE_LOW ? LOW  : HIGH;
+const int MAGNET_OFF = MAGNET_ACTIVE_LOW ? HIGH : LOW;
+
+// ============================================================================
+// 2. PIN DEFINITIONS (Plug Dupont wires directly from Arduino to Relay Module)
+// ============================================================================
+// Hoist UP (Top Button: Closes 1->3 and 2->4 simultaneously)
+const int PIN_RELAY_UP_LEFT    = 4; // Connect directly to IN1 (COM1: Screw 1, NO1: Screw 3)
+const int PIN_RELAY_UP_RIGHT   = 5; // Connect directly to IN2 (COM2: Screw 2, NO2: Screw 4)
+
+// Hoist DOWN (Bottom Button: Closes 1->5 and 2->6 simultaneously)
+const int PIN_RELAY_DOWN_LEFT  = 3; // Connect directly to IN3 (COM3: Screw 1, NO3: Screw 5)
+const int PIN_RELAY_DOWN_RIGHT = 6; // Connect directly to IN4 (COM4: Screw 2, NO4: Screw 6)
+
+// Electromagnet Control (IDEC Switch)
+const int PIN_RELAY_MAGNET     = 2; // Connect to Magnet Relay input
+
+// Optional Local Pushbutton Inputs (for Simulation / Manual Override)
+const int PIN_BTN_UP     = 8;
+const int PIN_BTN_DOWN   = 9;
+const int PIN_BTN_MAGNET = 10;
+
+// ============================================================================
+// 3. TIMING PARAMETERS (in milliseconds)
+// ============================================================================
+const unsigned long INTERLOCK_DELAY_MS = 200;  // Dead-time before reversing motor direction
+const unsigned long DROP_SETTLE_MS     = 1500; // Wait time after releasing weight
+const unsigned long LOWER_TIME_MS      = 3000; // Duration to lower hoist to pick up weight
+const unsigned long MAGNET_GRAB_MS     = 800;  // Wait time for magnet to grab weight
+const unsigned long LIFT_TIME_MS       = 3000; // Duration to lift weight back to drop height
+
+// ============================================================================
+// 4. SYSTEM STATE & HELPER FUNCTIONS
+// ============================================================================
+bool magnetEngaged  = false;
+bool pcHoistRunning = false;
+bool lastBtnMagnet  = HIGH;
+
+void stopHoist() {
+  digitalWrite(PIN_RELAY_UP_LEFT,    HOIST_OFF);
+  digitalWrite(PIN_RELAY_UP_RIGHT,   HOIST_OFF);
+  digitalWrite(PIN_RELAY_DOWN_LEFT,  HOIST_OFF);
+  digitalWrite(PIN_RELAY_DOWN_RIGHT, HOIST_OFF);
+  pcHoistRunning = false;
+}
+
+void moveHoistUp() {
+  // Software Interlock: Ensure both DOWN relays are OFF before engaging UP
+  if (digitalRead(PIN_RELAY_DOWN_LEFT) == HOIST_ON || digitalRead(PIN_RELAY_DOWN_RIGHT) == HOIST_ON) {
+    digitalWrite(PIN_RELAY_DOWN_LEFT,  HOIST_OFF);
+    digitalWrite(PIN_RELAY_DOWN_RIGHT, HOIST_OFF);
+    delay(INTERLOCK_DELAY_MS);
+  }
+  digitalWrite(PIN_RELAY_UP_LEFT,  HOIST_ON);
+  digitalWrite(PIN_RELAY_UP_RIGHT, HOIST_ON);
+}
+
+void moveHoistDown() {
+  // Software Interlock: Ensure both UP relays are OFF before engaging DOWN
+  if (digitalRead(PIN_RELAY_UP_LEFT) == HOIST_ON || digitalRead(PIN_RELAY_UP_RIGHT) == HOIST_ON) {
+    digitalWrite(PIN_RELAY_UP_LEFT,  HOIST_OFF);
+    digitalWrite(PIN_RELAY_UP_RIGHT, HOIST_OFF);
+    delay(INTERLOCK_DELAY_MS);
+  }
+  digitalWrite(PIN_RELAY_DOWN_LEFT,  HOIST_ON);
+  digitalWrite(PIN_RELAY_DOWN_RIGHT, HOIST_ON);
+}
+
+void setMagnet(bool enable) {
+  magnetEngaged = enable;
+  digitalWrite(PIN_RELAY_MAGNET, magnetEngaged ? MAGNET_ON : MAGNET_OFF);
+  Serial.print("[STATUS] Electromagnet: ");
+  Serial.println(magnetEngaged ? "ENGAGED (ON)" : "RELEASED (OFF)");
+}
+
+bool waitWithAbortCheck(unsigned long durationMs) {
+  unsigned long start = millis();;
+  while (millis() - start < durationMs) {
+    if (Serial.available() > 0) {
+      char c = toupper(Serial.read());
+      if (c == 'E' || c == 'S') {
+        stopHoist();
+        if (c == 'E') setMagnet(false);
+        Serial.println("[ABORT] Automated cycle aborted by user!");
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+void runAutomatedDropCycle() {
+  Serial.println("[CYCLE] Step 1/4: Releasing electromagnet to drop weight...");
+  stopHoist();
+  setMagnet(false);
+  if (!waitWithAbortCheck(DROP_SETTLE_MS)) return;
+
+  Serial.println("[CYCLE] Step 2/4: Lowering hoist to retrieve weight...");
+  moveHoistDown();
+  if (!waitWithAbortCheck(LOWER_TIME_MS)) return;
+  stopHoist();
+
+  Serial.println("[CYCLE] Step 3/4: Engaging electromagnet to grab weight...");
+  setMagnet(true);
+  if (!waitWithAbortCheck(MAGNET_GRAB_MS)) return;
+
+  Serial.println("[CYCLE] Step 4/4: Lifting weight back to drop height...");
+  moveHoistUp();
+  if (!waitWithAbortCheck(LIFT_TIME_MS)) return;
+  stopHoist();
+
+  Serial.println("[CYCLE] Complete! Weight is at drop height.");
+}
+
+void setup() {
+  // Pre-load all relay pins to OFF before enabling OUTPUT mode
+  stopHoist();
+  digitalWrite(PIN_RELAY_MAGNET, MAGNET_OFF);
+
+  pinMode(PIN_RELAY_UP_LEFT,    OUTPUT);
+  pinMode(PIN_RELAY_UP_RIGHT,   OUTPUT);
+  pinMode(PIN_RELAY_DOWN_LEFT,  OUTPUT);
+  pinMode(PIN_RELAY_DOWN_RIGHT, OUTPUT);
+  pinMode(PIN_RELAY_MAGNET,     OUTPUT);
+
+  pinMode(PIN_BTN_UP,     INPUT_PULLUP);
+  pinMode(PIN_BTN_DOWN,   INPUT_PULLUP);
+  pinMode(PIN_BTN_MAGNET, INPUT_PULLUP);
+
+  Serial.begin(9600);
+  Serial.println("=========================================================");
+  Serial.println(" UTARI 4-CHANNEL DPST HOIST & MAGNET CONTROLLER READY");
+  Serial.println(" Commands: [U] Up (IN1+IN2) | [D] Down (IN3+IN4) | [S] Stop");
+  Serial.println("           [1] Magnet ON | [0] Magnet OFF | [M] Toggle");
+  Serial.println("           [C] Auto Drop/Recovery Cycle | [E] E-STOP");
+  Serial.println("=========================================================");
+}
+
+void loop() {
+  bool btnUpPressed   = (digitalRead(PIN_BTN_UP) == LOW);
+  bool btnDownPressed = (digitalRead(PIN_BTN_DOWN) == LOW);
+  bool btnMagState    = digitalRead(PIN_BTN_MAGNET);
+
+  if (btnUpPressed && btnDownPressed) {
+    stopHoist();
+  } else if (btnUpPressed) {
+    pcHoistRunning = false;
+    moveHoistUp();
+  } else if (btnDownPressed) {
+    pcHoistRunning = false;
+    moveHoistDown();
+  } else if (!pcHoistRunning) {
+    stopHoist();
+  }
+
+  if (lastBtnMagnet == HIGH && btnMagState == LOW) {
+    delay(50);
+    if (digitalRead(PIN_BTN_MAGNET) == LOW) {
+      setMagnet(!magnetEngaged);
+    }
+  }
+  lastBtnMagnet = btnMagState;
+
+  if (Serial.available() > 0) {
+    char cmd = toupper(Serial.read());
+    switch (cmd) {
+      case 'U':
+        pcHoistRunning = true;
+        moveHoistUp();
+        Serial.println("[PC CMD] Hoist: MOVING UP (CH1 + CH2 ON)");
+        break;
+      case 'D':
+        pcHoistRunning = true;
+        moveHoistDown();
+        Serial.println("[PC CMD] Hoist: MOVING DOWN (CH3 + CH4 ON)");
+        break;
+      case 'S':
+        stopHoist();
+        Serial.println("[PC CMD] Hoist: STOPPED");
+        break;
+      case '1':
+        setMagnet(true);
+        break;
+      case '0':
+        setMagnet(false);
+        break;
+      case 'M':
+        setMagnet(!magnetEngaged);
+        break;
+      case 'C':
+        runAutomatedDropCycle();
+        break;
+      case 'E':
+        stopHoist();
+        setMagnet(false);
+        Serial.println("[EMERGENCY STOP] ALL RELAYS DE-ENERGIZED!");
+        break;
+    }
+  }
+}
